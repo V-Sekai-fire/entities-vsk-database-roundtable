@@ -1,10 +1,13 @@
 name: sqlite-fdb-vfs-workloadf
 on:
   push:
+concurrency:
+  group: sqlite-fdb-vfs-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   sqlite-fdb-vfs-workloadf:
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -42,36 +45,41 @@ jobs:
 
       - name: Install build toolchain
         run: |
-          sudo apt-get install -y build-essential cmake libsqlite3-dev
+          sudo apt-get install -y build-essential unzip
 
-      - name: Checkout datasource-store
+      - name: Checkout V-Sekai-fire/sqlite-jdbc (feat/fdb-vfs baked in)
         uses: actions/checkout@v4
         with:
-          repository: V-Sekai-fire/datasource-store
-          ref: main/main
-          path: store
+          repository: V-Sekai-fire/sqlite-jdbc
+          ref: feat/fdb-vfs
+          path: sqlite-jdbc-src
 
-      - name: Build the FDB-VFS SQLite loadable extension
+      - name: Build sqlite-jdbc with the FoundationDB VFS statically compiled in
+        env:
+          WEFT_BUILD_FDB_VFS: "1"
+          FDB_CLIENT_INCLUDE: /usr/include/foundationdb
         run: |
-          cmake -S store -B store/build -DCMAKE_BUILD_TYPE=Release
-          cmake --build store/build --target weft_fdb_vfs_ext -j "$(nproc)"
-          sudo install -m 0755 store/build/libweft_fdb_vfs_ext.so /usr/local/lib/
-          sudo ldconfig
+          cd sqlite-jdbc-src
+          make native
+          # Assemble a runnable jar from the compiled classes + native so.
+          find src/main -name '*.java' > /tmp/sources.txt
+          mkdir -p /tmp/sjdbc
+          javac -d /tmp/sjdbc @/tmp/sources.txt
+          cp -r src/main/resources/* /tmp/sjdbc/
+          (cd /tmp/sjdbc && jar cf /tmp/sqlite-jdbc-fdbvfs.jar .)
+          ls -lh /tmp/sqlite-jdbc-fdbvfs.jar
+          # slf4j-nop suppresses the SLF4J LoggerFactory startup crash for
+          # sqlite-jdbc versions that hard-depend on the SPI.
+          curl -sLo /tmp/slf4j-api.jar https://repo1.maven.org/maven2/org/slf4j/slf4j-api/1.7.36/slf4j-api-1.7.36.jar
+          curl -sLo /tmp/slf4j-nop.jar https://repo1.maven.org/maven2/org/slf4j/slf4j-nop/1.7.36/slf4j-nop-1.7.36.jar
 
-      - name: Download YCSB and SQLite JDBC driver
+      - name: Download YCSB
         run: |
           wget https://github.com/brianfrankcooper/YCSB/releases/download/0.17.0/ycsb-0.17.0.tar.gz
           tar xfvz ycsb-0.17.0.tar.gz
           sed -i '1s|.*|#!/usr/bin/env python2|' ycsb-0.17.0/bin/ycsb
-          wget -P ycsb-0.17.0/lib/ https://repo1.maven.org/maven2/org/xerial/sqlite-jdbc/3.42.0.0/sqlite-jdbc-3.42.0.0.jar
-
-      - name: Build the WeftSqliteDriver JAR
-        run: |
-          mkdir -p build/weftspun
-          cp .github/scripts/WeftSqliteDriver.java build/weftspun/
-          javac -cp ycsb-0.17.0/lib/sqlite-jdbc-3.42.0.0.jar \
-            -d build build/weftspun/WeftSqliteDriver.java
-          jar cf ycsb-0.17.0/lib/weft-sqlite-driver.jar -C build weftspun
+          cp /tmp/sqlite-jdbc-fdbvfs.jar ycsb-0.17.0/lib/
+          cp /tmp/slf4j-api.jar /tmp/slf4j-nop.jar ycsb-0.17.0/lib/
 
       - name: Create workload F configuration
         run: |
@@ -91,25 +99,18 @@ jobs:
           fieldlength=100
           EOL
 
-      - name: Create table through the FDB-backed VFS
+      - name: Create the usertable through the FDB-backed VFS
         env:
           WEFT_FDB_CLUSTER_FILE: /etc/foundationdb/fdb.cluster
         run: |
-          # Reuse the exact JDBC path YCSB will use, so the extension load,
-          # URI parsing and VFS lookup all happen inside the same JVM. The
-          # sqlite3 CLI's positional-arg open path did not honor ?vfs= here.
           cat > /tmp/CreateTable.java <<'EOF'
           import java.sql.*;
           public class CreateTable {
             public static void main(String[] a) throws Exception {
-              Class.forName("weftspun.WeftSqliteDriver");
+              Class.forName("org.sqlite.JDBC");
               try (Connection c = DriverManager.getConnection(
-                     "jdbc:weftsqlite:file:/tmp/ycsb.db?vfs=weft_fdb");
+                     "jdbc:sqlite:file:/tmp/ycsb.db?vfs=weft_fdb");
                    Statement s = c.createStatement()) {
-                try (ResultSet r = s.executeQuery(
-                    "SELECT name FROM pragma_vfs_list()")) {
-                  while (r.next()) System.err.println("vfs: " + r.getString(1));
-                }
                 s.execute("CREATE TABLE IF NOT EXISTS usertable ("
                         + " ycsb_key VARCHAR(255) PRIMARY KEY,"
                         + " field0 TEXT, field1 TEXT, field2 TEXT)");
@@ -118,10 +119,9 @@ jobs:
             }
           }
           EOF
-          javac -cp ycsb-0.17.0/lib/sqlite-jdbc-3.42.0.0.jar:ycsb-0.17.0/lib/weft-sqlite-driver.jar \
+          javac -cp /tmp/sqlite-jdbc-fdbvfs.jar:/tmp/slf4j-api.jar:/tmp/slf4j-nop.jar \
             -d /tmp /tmp/CreateTable.java
-          java -cp /tmp:ycsb-0.17.0/lib/sqlite-jdbc-3.42.0.0.jar:ycsb-0.17.0/lib/weft-sqlite-driver.jar \
-            CreateTable
+          java -cp /tmp:/tmp/sqlite-jdbc-fdbvfs.jar:/tmp/slf4j-api.jar:/tmp/slf4j-nop.jar CreateTable
 
       - name: Load initial data
         env:
@@ -129,8 +129,8 @@ jobs:
         run: |
           cd ycsb-0.17.0
           ./bin/ycsb load jdbc -s -P ../workloads/workloadf \
-            -p db.driver=weftspun.WeftSqliteDriver \
-            -p db.url='jdbc:weftsqlite:file:/tmp/ycsb.db?vfs=weft_fdb' \
+            -p db.driver=org.sqlite.JDBC \
+            -p db.url='jdbc:sqlite:file:/tmp/ycsb.db?vfs=weft_fdb' \
             -p jdbc.autocommit=true \
             -p db.batchsize=1000
 
@@ -140,8 +140,8 @@ jobs:
         run: |
           cd ycsb-0.17.0
           ./bin/ycsb run jdbc -s -P ../workloads/workloadf \
-            -p db.driver=weftspun.WeftSqliteDriver \
-            -p db.url='jdbc:weftsqlite:file:/tmp/ycsb.db?vfs=weft_fdb' \
+            -p db.driver=org.sqlite.JDBC \
+            -p db.url='jdbc:sqlite:file:/tmp/ycsb.db?vfs=weft_fdb' \
             -p jdbc.autocommit=true \
             -p db.batchsize=1000 > ../sqlite_fdb_vfs_results_workloadf.txt
 

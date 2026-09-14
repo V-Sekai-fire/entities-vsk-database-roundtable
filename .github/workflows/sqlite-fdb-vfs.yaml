@@ -1,16 +1,27 @@
-name: sqlite-fdb-vfs-bench
+name: sqlite-fdb-vfs-workloadf
 on:
   push:
 jobs:
-  sqlite-fdb-vfs-bench:
+  sqlite-fdb-vfs-workloadf:
     runs-on: ubuntu-22.04
+    timeout-minutes: 30
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install FoundationDB server and client
+      - name: Set up Java
+        uses: actions/setup-java@v3
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+
+      - name: Install Python 2
         run: |
           sudo apt-get update
+          sudo apt-get install -y python2
+
+      - name: Install FoundationDB server and client
+        run: |
           curl -LO https://github.com/apple/foundationdb/releases/download/7.3.63/foundationdb-server_7.3.63-1_amd64.deb
           curl -LO https://github.com/apple/foundationdb/releases/download/7.3.63/foundationdb-clients_7.3.63-1_amd64.deb
           sudo dpkg -i foundationdb-clients_7.3.63-1_amd64.deb
@@ -33,26 +44,90 @@ jobs:
         run: |
           sudo apt-get install -y build-essential cmake libsqlite3-dev
 
-      - name: Checkout datasource-store (the fdb_vfs and bench_vfs live there)
+      - name: Checkout datasource-store
         uses: actions/checkout@v4
         with:
           repository: V-Sekai-fire/datasource-store
           ref: main/main
           path: store
 
-      - name: Build bench_vfs
+      - name: Build the FDB-VFS SQLite loadable extension
         run: |
           cmake -S store -B store/build -DCMAKE_BUILD_TYPE=Release
-          cmake --build store/build --target bench_vfs -j "$(nproc)"
+          cmake --build store/build --target weft_fdb_vfs_ext -j "$(nproc)"
+          sudo install -m 0755 store/build/libweft_fdb_vfs_ext.so /usr/local/lib/
+          sudo ldconfig
 
-      - name: Run bench_vfs against local and FDB
+      - name: Download YCSB and SQLite JDBC driver
+        run: |
+          wget https://github.com/brianfrankcooper/YCSB/releases/download/0.17.0/ycsb-0.17.0.tar.gz
+          tar xfvz ycsb-0.17.0.tar.gz
+          sed -i '1s|.*|#!/usr/bin/env python2|' ycsb-0.17.0/bin/ycsb
+          wget -P ycsb-0.17.0/lib/ https://repo1.maven.org/maven2/org/xerial/sqlite-jdbc/3.42.0.0/sqlite-jdbc-3.42.0.0.jar
+
+      - name: Build the WeftSqliteDriver JAR
+        run: |
+          mkdir -p build/weftspun
+          cp .github/scripts/WeftSqliteDriver.java build/weftspun/
+          javac -cp ycsb-0.17.0/lib/sqlite-jdbc-3.42.0.0.jar \
+            -d build build/weftspun/WeftSqliteDriver.java
+          jar cf ycsb-0.17.0/lib/weft-sqlite-driver.jar -C build weftspun
+
+      - name: Create workload F configuration
+        run: |
+          mkdir -p workloads
+          cat > ./workloads/workloadf <<EOL
+          workload=site.ycsb.workloads.CoreWorkload
+          readallfields=true
+          readproportion=0.5
+          updateproportion=0
+          scanproportion=0
+          insertproportion=0
+          readmodifywriteproportion=0.5
+          requestdistribution=zipfian
+          recordcount=100000
+          operationcount=100000
+          fieldcount=3
+          fieldlength=100
+          EOL
+
+      - name: Create table through the FDB-backed VFS
         env:
           WEFT_FDB_CLUSTER_FILE: /etc/foundationdb/fdb.cluster
         run: |
-          store/build/bench_vfs 5000 | tee sqlite_fdb_vfs_results.txt
+          sqlite3 --cmd '.load /usr/local/lib/libweft_fdb_vfs_ext' \
+            'file:/tmp/ycsb.db?vfs=fdb_vfs' \
+            "CREATE TABLE IF NOT EXISTS usertable (
+              ycsb_key VARCHAR(255) PRIMARY KEY,
+              field0 TEXT,
+              field1 TEXT,
+              field2 TEXT
+            );"
 
-      - name: Upload SQLite FDB VFS results
+      - name: Load initial data
+        env:
+          WEFT_FDB_CLUSTER_FILE: /etc/foundationdb/fdb.cluster
+        run: |
+          cd ycsb-0.17.0
+          ./bin/ycsb load jdbc -s -P ../workloads/workloadf \
+            -p db.driver=weftspun.WeftSqliteDriver \
+            -p db.url='jdbc:weftsqlite:file:/tmp/ycsb.db?vfs=fdb_vfs' \
+            -p jdbc.autocommit=true \
+            -p db.batchsize=1000
+
+      - name: Run Workload F
+        env:
+          WEFT_FDB_CLUSTER_FILE: /etc/foundationdb/fdb.cluster
+        run: |
+          cd ycsb-0.17.0
+          ./bin/ycsb run jdbc -s -P ../workloads/workloadf \
+            -p db.driver=weftspun.WeftSqliteDriver \
+            -p db.url='jdbc:weftsqlite:file:/tmp/ycsb.db?vfs=fdb_vfs' \
+            -p jdbc.autocommit=true \
+            -p db.batchsize=1000 > ../sqlite_fdb_vfs_results_workloadf.txt
+
+      - name: Upload SQLite-FDB-VFS results
         uses: actions/upload-artifact@v4
         with:
-          name: sqlite-fdb-vfs-results
-          path: sqlite_fdb_vfs_results.txt
+          name: sqlite-fdb-vfs-results-workloadf
+          path: sqlite_fdb_vfs_results_workloadf.txt

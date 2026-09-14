@@ -62,7 +62,7 @@ jobs:
       - name: Run Workload F with optimized settings
         run: |
           cd YCSB
-          sed -i '1s/python/python3/' ./bin/ycsb
+          sed -i '1s|.*|#!/usr/bin/env python2|' ./bin/ycsb
           
           ./bin/ycsb load foundationdb -s -P workloads/workloadf \
             -p foundationdb.clusterfile=../fdb.cluster \

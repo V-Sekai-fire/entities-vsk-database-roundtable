@@ -16,6 +16,19 @@ jobs:
           sudo dpkg -i foundationdb-clients_7.3.63-1_amd64.deb
           sudo dpkg -i foundationdb-server_7.3.63-1_amd64.deb
 
+      - name: Wait for FoundationDB to be ready
+        run: |
+          sudo systemctl restart foundationdb
+          for i in $(seq 1 30); do
+            if fdbcli --exec "status minimal" --timeout 5 2>/dev/null | grep -q "available"; then
+              echo "FoundationDB is available"
+              break
+            fi
+            echo "waiting for FoundationDB ($i/30)"
+            sleep 2
+          done
+          fdbcli --exec "status" --timeout 10
+
       - name: Install build toolchain
         run: |
           sudo apt-get install -y build-essential cmake libsqlite3-dev
@@ -36,7 +49,7 @@ jobs:
         env:
           WEFT_FDB_CLUSTER_FILE: /etc/foundationdb/fdb.cluster
         run: |
-          store/build/bench_vfs 100000 | tee sqlite_fdb_vfs_results.txt
+          store/build/bench_vfs 5000 | tee sqlite_fdb_vfs_results.txt
 
       - name: Upload SQLite FDB VFS results
         uses: actions/upload-artifact@v4

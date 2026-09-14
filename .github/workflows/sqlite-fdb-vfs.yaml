@@ -1,0 +1,45 @@
+name: sqlite-fdb-vfs-bench
+on:
+  push:
+jobs:
+  sqlite-fdb-vfs-bench:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install FoundationDB server and client
+        run: |
+          sudo apt-get update
+          curl -LO https://github.com/apple/foundationdb/releases/download/7.3.63/foundationdb-server_7.3.63-1_amd64.deb
+          curl -LO https://github.com/apple/foundationdb/releases/download/7.3.63/foundationdb-clients_7.3.63-1_amd64.deb
+          sudo dpkg -i foundationdb-clients_7.3.63-1_amd64.deb
+          sudo dpkg -i foundationdb-server_7.3.63-1_amd64.deb
+
+      - name: Install build toolchain
+        run: |
+          sudo apt-get install -y build-essential cmake libsqlite3-dev
+
+      - name: Checkout datasource-store (the fdb_vfs and bench_vfs live there)
+        uses: actions/checkout@v4
+        with:
+          repository: V-Sekai-fire/datasource-store
+          ref: main/main
+          path: store
+
+      - name: Build bench_vfs
+        run: |
+          cmake -S store -B store/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build store/build --target bench_vfs -j "$(nproc)"
+
+      - name: Run bench_vfs against local and FDB
+        env:
+          WEFT_FDB_CLUSTER_FILE: /etc/foundationdb/fdb.cluster
+        run: |
+          store/build/bench_vfs 100000 | tee sqlite_fdb_vfs_results.txt
+
+      - name: Upload SQLite FDB VFS results
+        uses: actions/upload-artifact@v4
+        with:
+          name: sqlite-fdb-vfs-results
+          path: sqlite_fdb_vfs_results.txt

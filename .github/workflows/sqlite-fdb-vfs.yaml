@@ -95,22 +95,33 @@ jobs:
         env:
           WEFT_FDB_CLUSTER_FILE: /etc/foundationdb/fdb.cluster
         run: |
-          # Load extension with an explicit entry point (SQLite's auto-derived
-          # name would be sqlite3_weftfdbvfsext_init, but ours is
-          # sqlite3_weftfdbvfs_init). -bail makes the CLI stop on the first
-          # error so a silent .load failure doesn't hide behind the CREATE.
-          sqlite3 -bail \
-            --cmd ".load /usr/local/lib/libweft_fdb_vfs_ext sqlite3_weftfdbvfs_init" \
-            --cmd '.output stderr' \
-            --cmd "SELECT 'registered vfs: '||name FROM pragma_vfs_list();" \
-            --cmd '.output stdout' \
-            'file:/tmp/ycsb.db?vfs=weft_fdb' \
-            "CREATE TABLE IF NOT EXISTS usertable (
-              ycsb_key VARCHAR(255) PRIMARY KEY,
-              field0 TEXT,
-              field1 TEXT,
-              field2 TEXT
-            );"
+          # Reuse the exact JDBC path YCSB will use, so the extension load,
+          # URI parsing and VFS lookup all happen inside the same JVM. The
+          # sqlite3 CLI's positional-arg open path did not honor ?vfs= here.
+          cat > /tmp/CreateTable.java <<'EOF'
+          import java.sql.*;
+          public class CreateTable {
+            public static void main(String[] a) throws Exception {
+              Class.forName("weftspun.WeftSqliteDriver");
+              try (Connection c = DriverManager.getConnection(
+                     "jdbc:weftsqlite:file:/tmp/ycsb.db?vfs=weft_fdb");
+                   Statement s = c.createStatement()) {
+                try (ResultSet r = s.executeQuery(
+                    "SELECT name FROM pragma_vfs_list()")) {
+                  while (r.next()) System.err.println("vfs: " + r.getString(1));
+                }
+                s.execute("CREATE TABLE IF NOT EXISTS usertable ("
+                        + " ycsb_key VARCHAR(255) PRIMARY KEY,"
+                        + " field0 TEXT, field1 TEXT, field2 TEXT)");
+                System.out.println("usertable ready");
+              }
+            }
+          }
+          EOF
+          javac -cp ycsb-0.17.0/lib/sqlite-jdbc-3.42.0.0.jar:ycsb-0.17.0/lib/weft-sqlite-driver.jar \
+            -d /tmp /tmp/CreateTable.java
+          java -cp /tmp:ycsb-0.17.0/lib/sqlite-jdbc-3.42.0.0.jar:ycsb-0.17.0/lib/weft-sqlite-driver.jar \
+            CreateTable
 
       - name: Load initial data
         env:

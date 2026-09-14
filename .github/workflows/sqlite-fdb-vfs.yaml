@@ -95,7 +95,15 @@ jobs:
         env:
           WEFT_FDB_CLUSTER_FILE: /etc/foundationdb/fdb.cluster
         run: |
-          sqlite3 --cmd '.load /usr/local/lib/libweft_fdb_vfs_ext' \
+          # Load extension with an explicit entry point (SQLite's auto-derived
+          # name would be sqlite3_weftfdbvfsext_init, but ours is
+          # sqlite3_weftfdbvfs_init). -bail makes the CLI stop on the first
+          # error so a silent .load failure doesn't hide behind the CREATE.
+          sqlite3 -bail \
+            --cmd ".load /usr/local/lib/libweft_fdb_vfs_ext sqlite3_weftfdbvfs_init" \
+            --cmd '.output stderr' \
+            --cmd "SELECT 'registered vfs: '||name FROM pragma_vfs_list();" \
+            --cmd '.output stdout' \
             'file:/tmp/ycsb.db?vfs=weft_fdb' \
             "CREATE TABLE IF NOT EXISTS usertable (
               ycsb_key VARCHAR(255) PRIMARY KEY,

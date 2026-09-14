@@ -19,12 +19,14 @@ public class WeftSqliteDriver implements java.sql.Driver {
 
 	static final String PREFIX = "jdbc:weftsqlite:";
 	static final String EXTENSION_PATH_PROPERTY = "weftspun.sqlite.extension";
+	static final String EXTENSION_ENTRY = "sqlite3_weftfdbvfs_init";
 	static volatile boolean loaded = false;
 
 	static {
 		try {
+			Class.forName("org.sqlite.JDBC");
 			DriverManager.registerDriver(new WeftSqliteDriver());
-		} catch (SQLException e) {
+		} catch (ClassNotFoundException | SQLException e) {
 			throw new RuntimeException(e);
 		}
 	}
@@ -44,7 +46,7 @@ public class WeftSqliteDriver implements java.sql.Driver {
 							EXTENSION_PATH_PROPERTY,
 							"/usr/local/lib/libweft_fdb_vfs_ext");
 					try (Statement st = conn.createStatement()) {
-						st.execute("SELECT load_extension('" + path + "')");
+						st.execute("SELECT load_extension('" + path + "', '" + EXTENSION_ENTRY + "')");
 					}
 					loaded = true;
 				}

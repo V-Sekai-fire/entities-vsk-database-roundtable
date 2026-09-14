@@ -63,13 +63,13 @@ jobs:
           wget https://github.com/brianfrankcooper/YCSB/releases/download/0.17.0/ycsb-0.17.0.tar.gz
           tar xfvz ycsb-0.17.0.tar.gz
           sed -i '1s|.*|#!/usr/bin/env python2|' ycsb-0.17.0/bin/ycsb
-          wget -P ycsb-0.17.0/lib/ https://repo1.maven.org/maven2/org/xerial/sqlite-jdbc/3.45.3.0/sqlite-jdbc-3.45.3.0.jar
+          wget -P ycsb-0.17.0/lib/ https://repo1.maven.org/maven2/org/xerial/sqlite-jdbc/3.42.0.0/sqlite-jdbc-3.42.0.0.jar
 
       - name: Build the WeftSqliteDriver JAR
         run: |
           mkdir -p build/weftspun
           cp .github/scripts/WeftSqliteDriver.java build/weftspun/
-          javac -cp ycsb-0.17.0/lib/sqlite-jdbc-3.45.3.0.jar \
+          javac -cp ycsb-0.17.0/lib/sqlite-jdbc-3.42.0.0.jar \
             -d build build/weftspun/WeftSqliteDriver.java
           jar cf ycsb-0.17.0/lib/weft-sqlite-driver.jar -C build weftspun
 

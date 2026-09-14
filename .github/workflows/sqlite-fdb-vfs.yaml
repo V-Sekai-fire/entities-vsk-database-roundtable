@@ -96,7 +96,7 @@ jobs:
           WEFT_FDB_CLUSTER_FILE: /etc/foundationdb/fdb.cluster
         run: |
           sqlite3 --cmd '.load /usr/local/lib/libweft_fdb_vfs_ext' \
-            'file:/tmp/ycsb.db?vfs=fdb_vfs' \
+            'file:/tmp/ycsb.db?vfs=weft_fdb' \
             "CREATE TABLE IF NOT EXISTS usertable (
               ycsb_key VARCHAR(255) PRIMARY KEY,
               field0 TEXT,
@@ -111,7 +111,7 @@ jobs:
           cd ycsb-0.17.0
           ./bin/ycsb load jdbc -s -P ../workloads/workloadf \
             -p db.driver=weftspun.WeftSqliteDriver \
-            -p db.url='jdbc:weftsqlite:file:/tmp/ycsb.db?vfs=fdb_vfs' \
+            -p db.url='jdbc:weftsqlite:file:/tmp/ycsb.db?vfs=weft_fdb' \
             -p jdbc.autocommit=true \
             -p db.batchsize=1000
 
@@ -122,7 +122,7 @@ jobs:
           cd ycsb-0.17.0
           ./bin/ycsb run jdbc -s -P ../workloads/workloadf \
             -p db.driver=weftspun.WeftSqliteDriver \
-            -p db.url='jdbc:weftsqlite:file:/tmp/ycsb.db?vfs=fdb_vfs' \
+            -p db.url='jdbc:weftsqlite:file:/tmp/ycsb.db?vfs=weft_fdb' \
             -p jdbc.autocommit=true \
             -p db.batchsize=1000 > ../sqlite_fdb_vfs_results_workloadf.txt
 

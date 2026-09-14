@@ -47,11 +47,11 @@ jobs:
         run: |
           sudo apt-get install -y build-essential unzip
 
-      - name: Checkout V-Sekai-fire/sqlite-jdbc (feat/fdb-vfs baked in)
+      - name: Checkout V-Sekai-fire/sqlite-jdbc (fdb_vfs merged into master)
         uses: actions/checkout@v4
         with:
           repository: V-Sekai-fire/sqlite-jdbc
-          ref: feat/fdb-vfs
+          ref: master
           path: sqlite-jdbc-src
 
       - name: Build sqlite-jdbc with the FoundationDB VFS statically compiled in

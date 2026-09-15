@@ -1,6 +1,9 @@
 name: cockroachdb-workloadf
 on:
   push:
+concurrency:
+  group: cdb-workloadf-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   cockroachdb-workloadf:
     runs-on: ubuntu-22.04

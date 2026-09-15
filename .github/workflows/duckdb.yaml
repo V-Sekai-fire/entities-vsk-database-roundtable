@@ -1,6 +1,9 @@
 name: duckdb-workloadf
 on:
   push:
+concurrency:
+  group: duckdb-workloadf-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   duckdb-workloadf:
     runs-on: ubuntu-22.04

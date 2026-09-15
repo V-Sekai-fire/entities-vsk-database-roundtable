@@ -72,7 +72,7 @@ jobs:
           repository: V-Sekai-fire/datasource-store
           # main/main is the workspace's default branch name; Rung 11
           # (V-Sekai-fire/datasource-store#13) landed there.
-          ref: share-read-txn
+          ref: main/main
           path: datasource-store
 
       - name: Build the store's ycsb_direct binary
@@ -97,7 +97,11 @@ jobs:
           # FdbFile. Before this fix, every xRead paid one GRV round-trip
           # (~1-5 ms on CI); 100k reads gave 100-500 s of wall.
           # 90 s timeout so a stuck workload fails the step and surfaces the log
-          # instead of burning the 30 min job budget.
+          # instead of burning the 30 min job budget. `set -o pipefail` makes
+          # the pipeline exit code the first non-zero one, so `timeout`'s 124
+          # (or a real workload error) fails the step; without it, `tee`'s 0
+          # would mask both.
+          set -o pipefail
           timeout 90 ./build/ycsb_direct 100000 100000 2 1000 2>&1 | tee /tmp/ycsb-direct.log
 
       - name: Report throughput

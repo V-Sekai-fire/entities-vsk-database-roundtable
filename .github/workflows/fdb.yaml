@@ -1,6 +1,9 @@
 name: foundationdb-workloadf
 on:
   push:
+concurrency:
+  group: fdb-workloadf-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   foundationdb-workloadf:
     runs-on: ubuntu-22.04

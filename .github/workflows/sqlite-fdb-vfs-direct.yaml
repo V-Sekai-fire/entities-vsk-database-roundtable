@@ -8,6 +8,8 @@ jobs:
   sqlite-fdb-vfs-direct-workloadf:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
+    env:
+      STORE_VERSION: v0.1.0-dev.1
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -70,9 +72,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: V-Sekai-fire/datasource-store
-          # main/main is the workspace's default branch name; Rung 11
-          # (V-Sekai-fire/datasource-store#13) landed there.
-          ref: main/main
+          # A tag, not the main/main branch tip: every other round pins its
+          # subject (postgres:18, cockroach-v22.1.21, duckdb_jdbc-0.10.0,
+          # foundationdb 7.3.63), and a moving ref here would mean this
+          # column silently measured something different run to run.
+          # Bump this deliberately when there is a new state to measure.
+          ref: ${{ env.STORE_VERSION }}
           path: datasource-store
 
       - name: Build the store's ycsb_direct binary
@@ -96,23 +101,37 @@ jobs:
           # transaction shared across xRead calls, cached for 4 s per
           # FdbFile. Before this fix, every xRead paid one GRV round-trip
           # (~1-5 ms on CI); 100k reads gave 100-500 s of wall.
-          # 90 s timeout so a stuck workload fails the step and surfaces the log
-          # instead of burning the 30 min job budget. `set -o pipefail` makes
-          # the pipeline exit code the first non-zero one, so `timeout`'s 124
-          # (or a real workload error) fails the step; without it, `tee`'s 0
-          # would mask both.
+          # The binary prints its whole report at the end, so nothing reaches
+          # the log until the run finishes; a timeout leaves it empty. The cap
+          # is therefore only a backstop against a hung workload eating the
+          # 30 min job budget, not a perf assertion. A healthy round is ~22 s,
+          # but it shares the runner with the FDB cluster, so 90 s was close
+          # enough to the noise floor to fail on load; 300 s is not.
+          # `set -o pipefail` makes the pipeline exit code the first non-zero
+          # one, so `timeout`'s 124 (or a real workload error) fails the step;
+          # without it, `tee`'s 0 would mask both.
           set -o pipefail
-          timeout 90 ./build/ycsb_direct 100000 100000 2 1000 2>&1 | tee /tmp/ycsb-direct.log
+          timeout 300 ./build/ycsb_direct 100000 100000 2 1000 2>&1 | tee /tmp/ycsb-direct.log
+
+      - name: Report FoundationDB status on failure
+        if: failure()
+        run: fdbcli --exec "status details" --timeout 10 || true
 
       - name: Report throughput
+        if: always()
         run: |
           echo '## sqlite-fdb-vfs-direct workload F (cache-size ladder)' >> $GITHUB_STEP_SUMMARY
           echo '' >> $GITHUB_STEP_SUMMARY
+          echo "datasource-store $STORE_VERSION ($(git -C datasource-store rev-parse --short HEAD 2>/dev/null || echo unknown))" >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          cat /tmp/ycsb-direct.log >> $GITHUB_STEP_SUMMARY
+          # A timed-out or crashed workload leaves the log empty or absent,
+          # and this step runs anyway so that shows up in the summary.
+          cat /tmp/ycsb-direct.log 2>/dev/null >> $GITHUB_STEP_SUMMARY || true
           echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Upload log
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ycsb-direct-log

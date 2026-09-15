@@ -1,0 +1,128 @@
+name: yugabytedb-workloadf
+on:
+  push:
+concurrency:
+  group: yugabyte-workloadf-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  yugabytedb-workloadf:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v3
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+
+      - name: Install Python 2 for YCSB
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python2
+
+      - name: Download YCSB and PostgreSQL JDBC driver
+        run: |
+          wget https://github.com/brianfrankcooper/YCSB/releases/download/0.17.0/ycsb-0.17.0.tar.gz
+          tar xfvz ycsb-0.17.0.tar.gz
+          sed -i '1s/python/python2/' ycsb-0.17.0/bin/ycsb
+          wget -P ycsb-0.17.0/lib/ https://jdbc.postgresql.org/download/postgresql-42.6.0.jar
+
+      - name: Install and start YugabyteDB
+        run: |
+          # yugabyted is YugabyteDB's single-binary launcher. YSQL binds
+          # 5433 (Postgres wire), which is what YCSB's JDBC binding uses.
+          # The download path carries the build number as well as the
+          # version, and -f makes a wrong one fail here on the 404 instead
+          # of handing tar an HTML error page ("not in gzip format").
+          curl -fsSL https://downloads.yugabyte.com/releases/2024.2.4.0/yugabyte-2024.2.4.0-b89-linux-x86_64.tar.gz \
+            -o yugabyte.tar.gz
+          tar xzf yugabyte.tar.gz
+          cd yugabyte-2024.2.4.0
+          ./bin/post_install.sh
+          ./bin/yugabyted start --advertise_address=127.0.0.1 --daemon=true
+          ready=
+          for i in $(seq 1 60); do
+            if postgres/bin/pg_isready -h 127.0.0.1 -p 5433 2>/dev/null; then
+              echo "YugabyteDB is ready"
+              ready=1
+              break
+            fi
+            echo "waiting for YugabyteDB ($i/60)"
+            sleep 5
+          done
+          # Without this the loop just falls through after 5 minutes and
+          # the failure surfaces as an ysqlsh connection error, which reads
+          # like a schema bug rather than a server that never came up.
+          if [ -z "$ready" ]; then
+            echo "YSQL did not accept connections on 5433 within 5 minutes"
+            ./bin/yugabyted status || true
+            exit 1
+          fi
+          # The distribution ships no `psql`: ysqlsh is Yugabyte's rebuilt
+          # psql and is what yugabyted's own banner points at. pg_isready
+          # above is the one stock-named client binary in the tarball.
+          bin/ysqlsh -h 127.0.0.1 -p 5433 -U yugabyte -d yugabyte -c \
+            "CREATE DATABASE ycsb;"
+          bin/ysqlsh -h 127.0.0.1 -p 5433 -U yugabyte -d ycsb -c \
+            "CREATE TABLE IF NOT EXISTS usertable (
+              ycsb_key VARCHAR(255) PRIMARY KEY,
+              field0 TEXT,
+              field1 TEXT,
+              field2 TEXT
+            );"
+
+      - name: Create workload F configuration
+        run: |
+          mkdir -p workloads
+          cat > ./workloads/workloadf <<EOL
+          workload=site.ycsb.workloads.CoreWorkload
+          readallfields=true
+          readproportion=0.5
+          updateproportion=0
+          scanproportion=0
+          insertproportion=0
+          readmodifywriteproportion=0.5
+          requestdistribution=zipfian
+          recordcount=100000
+          operationcount=100000
+          fieldcount=3
+          fieldlength=100
+          EOL
+
+      - name: Load initial data and run Workload F
+        run: |
+          set -o pipefail
+          cd ycsb-0.17.0
+          ./bin/ycsb load jdbc -s -P ../workloads/workloadf \
+            -p db.driver=org.postgresql.Driver \
+            -p db.url="jdbc:postgresql://localhost:5433/ycsb" \
+            -p db.user=yugabyte \
+            -p db.passwd="" \
+            -p jdbc.fetchsize=10 \
+            -p jdbc.autocommit=true \
+            -p db.batchsize=1000
+          ./bin/ycsb run jdbc -s -P ../workloads/workloadf \
+            -p db.driver=org.postgresql.Driver \
+            -p db.url="jdbc:postgresql://localhost:5433/ycsb" \
+            -p db.user=yugabyte \
+            -p db.passwd="" \
+            -p jdbc.fetchsize=10 \
+            -p jdbc.autocommit=true \
+            -p db.batchsize=1000 2>&1 | tee ../yugabytedb_results_workloadf.txt
+
+      - name: Report throughput
+        run: |
+          echo '## yugabytedb workload F' >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat yugabytedb_results_workloadf.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload YugabyteDB results
+        uses: actions/upload-artifact@v4
+        with:
+          name: yugabytedb-results-workloadf
+          path: yugabytedb_results_workloadf.txt

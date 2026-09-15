@@ -1,0 +1,115 @@
+name: sqlite-fdb-vfs-direct-workloadf
+on:
+  push:
+concurrency:
+  group: sqlite-fdb-vfs-direct-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  sqlite-fdb-vfs-direct-workloadf:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install FoundationDB server and client
+        run: |
+          curl -LO https://github.com/apple/foundationdb/releases/download/7.3.63/foundationdb-server_7.3.63-1_amd64.deb
+          curl -LO https://github.com/apple/foundationdb/releases/download/7.3.63/foundationdb-clients_7.3.63-1_amd64.deb
+          sudo dpkg -i foundationdb-clients_7.3.63-1_amd64.deb
+          sudo dpkg -i foundationdb-server_7.3.63-1_amd64.deb
+
+      - name: Wait for FoundationDB to be ready
+        run: |
+          sudo systemctl restart foundationdb
+          for i in $(seq 1 30); do
+            if fdbcli --exec "status minimal" --timeout 5 2>/dev/null | grep -q "available"; then
+              echo "FoundationDB is available"
+              break
+            fi
+            echo "waiting for FoundationDB ($i/30)"
+            sleep 2
+          done
+          fdbcli --exec "status" --timeout 10
+
+      - name: Reconfigure FoundationDB to redwood storage engine
+        run: |
+          fdbcli --exec "configure ssd-redwood-1-experimental storage_migration_type=aggressive" --timeout 10
+          # Wait for three signals: the engine is ssd-redwood, replication
+          # health is Healthy, and no FDB process reports "with errors".
+          # Any of these missing means the cluster has not settled; a workload
+          # started against it stalls in weft_fdb_start. Cap the wait at
+          # 5 minutes so an unproductive cluster fails the step instead of
+          # hanging the job.
+          deadline=$((SECONDS + 300))
+          while [ $SECONDS -lt $deadline ]; do
+            details=$(fdbcli --exec "status details" --timeout 10 2>/dev/null || true)
+            engine=$(echo "$details" | grep -c "Storage engine  *- ssd-redwood" || true)
+            healthy=$(echo "$details" | grep -c "Replication health  *- Healthy" || true)
+            errors=$(echo "$details" | grep -Ec "with errors|no metrics available|unknown" || true)
+            if [ "$engine" -ge 1 ] && [ "$healthy" -ge 1 ] && [ "$errors" -eq 0 ]; then
+              echo "FoundationDB is on redwood and healthy"
+              break
+            fi
+            echo "waiting for redwood conversion: engine=$engine healthy=$healthy errors=$errors"
+            sleep 5
+          done
+          if [ $SECONDS -ge $deadline ]; then
+            echo "FDB did not settle within 5 minutes; aborting"
+            fdbcli --exec "status details" --timeout 10
+            exit 1
+          fi
+          fdbcli --exec "status details" --timeout 10
+
+      - name: Install build toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libsqlite3-dev python3
+
+      - name: Checkout V-Sekai-fire/datasource-store (Rung 11, direct-linked)
+        uses: actions/checkout@v4
+        with:
+          repository: V-Sekai-fire/datasource-store
+          # main/main is the workspace's default branch name; Rung 11
+          # (V-Sekai-fire/datasource-store#13) landed there.
+          ref: share-read-txn
+          path: datasource-store
+
+      - name: Build the store's ycsb_direct binary
+        working-directory: datasource-store
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target ycsb_direct -j
+          ls -la build/ycsb_direct
+
+      - name: Run YCSB workload F
+        env:
+          WEFT_FDB_CLUSTER_FILE: /etc/foundationdb/fdb.cluster
+        working-directory: datasource-store
+        run: |
+          # ycsb_direct is a direct-linked native driver: each worker opens
+          # sqlite3* against the FDB VFS in-process. 100000 records /
+          # 100000 ops, 50%% READ + 50%% RMW, matching the pg/cdb/duckdb
+          # rounds' substrate load.
+          #
+          # Measures V-Sekai-fire/datasource-store#20: one FDB read
+          # transaction shared across xRead calls, cached for 4 s per
+          # FdbFile. Before this fix, every xRead paid one GRV round-trip
+          # (~1-5 ms on CI); 100k reads gave 100-500 s of wall.
+          # 90 s timeout so a stuck workload fails the step and surfaces the log
+          # instead of burning the 30 min job budget.
+          timeout 90 ./build/ycsb_direct 100000 100000 2 1000 2>&1 | tee /tmp/ycsb-direct.log
+
+      - name: Report throughput
+        run: |
+          echo '## sqlite-fdb-vfs-direct workload F (cache-size ladder)' >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat /tmp/ycsb-direct.log >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload log
+        uses: actions/upload-artifact@v4
+        with:
+          name: ycsb-direct-log
+          path: /tmp/ycsb-direct.log

@@ -1,0 +1,106 @@
+name: cassandra-workloadf
+on:
+  push:
+concurrency:
+  group: cassandra-workloadf-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  cassandra-workloadf:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    services:
+      cassandra:
+        image: cassandra:4.1
+        ports:
+          - 9042:9042
+        env:
+          CASSANDRA_START_RPC: "false"
+          MAX_HEAP_SIZE: 2G
+          HEAP_NEWSIZE: 512M
+        options: >-
+          --health-cmd "cqlsh -e 'SELECT release_version FROM system.local'"
+          --health-interval 15s
+          --health-timeout 10s
+          --health-retries 30
+          --health-start-period 90s
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v3
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+
+      - name: Install Python 2 for YCSB and cqlsh for schema
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python2 python3-pip
+          pip3 install --quiet 'cqlsh==6.2.0'
+
+      - name: Download YCSB with the Cassandra CQL binding
+        run: |
+          wget https://github.com/brianfrankcooper/YCSB/releases/download/0.17.0/ycsb-0.17.0.tar.gz
+          tar xfvz ycsb-0.17.0.tar.gz
+          sed -i '1s/python/python2/' ycsb-0.17.0/bin/ycsb
+
+      - name: Create keyspace and table
+        run: |
+          cqlsh 127.0.0.1 9042 -e "
+          CREATE KEYSPACE IF NOT EXISTS ycsb
+            WITH replication = {'class':'SimpleStrategy','replication_factor':1};
+          CREATE TABLE IF NOT EXISTS ycsb.usertable (
+            y_id VARCHAR PRIMARY KEY,
+            field0 VARCHAR,
+            field1 VARCHAR,
+            field2 VARCHAR
+          );"
+
+      - name: Create workload F configuration
+        run: |
+          mkdir -p workloads
+          cat > ./workloads/workloadf <<EOL
+          workload=site.ycsb.workloads.CoreWorkload
+          readallfields=true
+          readproportion=0.5
+          updateproportion=0
+          scanproportion=0
+          insertproportion=0
+          readmodifywriteproportion=0.5
+          requestdistribution=zipfian
+          recordcount=100000
+          operationcount=100000
+          fieldcount=3
+          fieldlength=100
+          EOL
+
+      - name: Load initial data and run Workload F
+        run: |
+          set -o pipefail
+          cd ycsb-0.17.0
+          ./bin/ycsb load cassandra-cql -s -P ../workloads/workloadf \
+            -p hosts=127.0.0.1 \
+            -p port=9042 \
+            -p cassandra.keyspace=ycsb \
+            -threads 8
+          ./bin/ycsb run cassandra-cql -s -P ../workloads/workloadf \
+            -p hosts=127.0.0.1 \
+            -p port=9042 \
+            -p cassandra.keyspace=ycsb \
+            -threads 8 2>&1 | tee ../cassandra_results_workloadf.txt
+
+      - name: Report throughput
+        run: |
+          echo '## cassandra workload F' >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat cassandra_results_workloadf.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload Cassandra results
+        uses: actions/upload-artifact@v4
+        with:
+          name: cassandra-results-workloadf
+          path: cassandra_results_workloadf.txt

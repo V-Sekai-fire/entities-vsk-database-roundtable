@@ -3,7 +3,7 @@ on:
   push:
 concurrency:
   group: cassandra-workloadf-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 jobs:
   cassandra-workloadf:
     runs-on: ubuntu-22.04

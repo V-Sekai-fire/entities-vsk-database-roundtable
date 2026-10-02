@@ -3,7 +3,7 @@ on:
   push:
 concurrency:
   group: fdb-workloadf-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 jobs:
   foundationdb-workloadf:
     runs-on: ubuntu-22.04

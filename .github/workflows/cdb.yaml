@@ -3,7 +3,7 @@ on:
   push:
 concurrency:
   group: cdb-workloadf-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 jobs:
   cockroachdb-workloadf:
     runs-on: ubuntu-22.04

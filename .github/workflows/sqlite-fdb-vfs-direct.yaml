@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     env:
-      STORE_VERSION: v0.1.0-dev.1
+      STORE_VERSION: 6fe36af46cbc3a6eca89c89bca9ff94dd6e315ba
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -34,34 +34,28 @@ jobs:
           done
           fdbcli --exec "status" --timeout 10
 
-      - name: Reconfigure FoundationDB to redwood storage engine
+      - name: One FoundationDB process per core, on the memory engine
         run: |
-          fdbcli --exec "configure ssd-redwood-1-experimental storage_migration_type=aggressive" --timeout 10
-          # Wait for three signals: the engine is ssd-redwood, replication
-          # health is Healthy, and no FDB process reports "with errors".
-          # Any of these missing means the cluster has not settled; a workload
-          # started against it stalls in weft_fdb_start. Cap the wait at
-          # 5 minutes so an unproductive cluster fails the step instead of
-          # hanging the job.
-          deadline=$((SECONDS + 300))
-          while [ $SECONDS -lt $deadline ]; do
-            details=$(fdbcli --exec "status details" --timeout 10 2>/dev/null || true)
-            engine=$(echo "$details" | grep -c "Storage engine  *- ssd-redwood" || true)
-            healthy=$(echo "$details" | grep -c "Replication health  *- Healthy" || true)
-            errors=$(echo "$details" | grep -Ec "with errors|no metrics available|unknown" || true)
-            if [ "$engine" -ge 1 ] && [ "$healthy" -ge 1 ] && [ "$errors" -eq 0 ]; then
-              echo "FoundationDB is on redwood and healthy"
+          # The package starts one fdbserver. A cluster of one process has one
+          # commit proxy, one resolver and one log, so every worker's commit
+          # queues behind the others. One process per core lets FoundationDB
+          # spread its roles. The memory engine keeps the data in RAM and logs
+          # to disk, which is what a single-runner benchmark can afford; the
+          # earlier redwood conversion also cost up to five minutes of setup.
+          conf=/etc/foundationdb/foundationdb.conf
+          for port in $(seq 4501 $((4500 + $(nproc) - 1))); do
+            printf '\n[fdbserver.%s]\n' "$port" | sudo tee -a "$conf" >/dev/null
+          done
+          sudo sed -i '/^\[fdbserver\]/a storage_memory = 4GiB' "$conf"
+          sudo systemctl restart foundationdb
+          fdbcli --exec "configure memory" --timeout 30
+          for i in $(seq 1 60); do
+            if fdbcli --exec "status" --timeout 10 2>/dev/null | grep -q "Replication health  *- Healthy"; then
               break
             fi
-            echo "waiting for redwood conversion: engine=$engine healthy=$healthy errors=$errors"
-            sleep 5
+            sleep 2
           done
-          if [ $SECONDS -ge $deadline ]; then
-            echo "FDB did not settle within 5 minutes; aborting"
-            fdbcli --exec "status details" --timeout 10
-            exit 1
-          fi
-          fdbcli --exec "status details" --timeout 10
+          fdbcli --exec "status" --timeout 10
 
       - name: Install build toolchain
         run: |
@@ -72,7 +66,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: V-Sekai-fire/datasource-store
-          # A tag, not the main branch tip: every other round pins its
+          # A tag or a commit, never a branch tip: every other round pins its
           # subject (postgres:18, cockroach-v22.1.21, duckdb_jdbc-0.10.0,
           # foundationdb 7.3.63), and a moving ref here would mean this
           # column silently measured something different run to run.
@@ -83,7 +77,8 @@ jobs:
       - name: Build the store's ycsb_direct binary
         working-directory: datasource-store
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON
           cmake --build build --target ycsb_direct -j
           ls -la build/ycsb_direct
 
@@ -93,25 +88,24 @@ jobs:
         working-directory: datasource-store
         run: |
           # ycsb_direct is a direct-linked native driver: each worker opens
-          # sqlite3* against the FDB VFS in-process. 100000 records /
-          # 100000 ops, 50%% READ + 50%% RMW, matching the pg/cdb/duckdb
-          # rounds' substrate load.
+          # sqlite3* against the FDB VFS in-process, on a database of its own.
+          # One worker per core, and the records and operations divided among
+          # them, so the totals are the other rounds' 100000 records and
+          # 100000 operations, 50% READ + 50% RMW. Group commit of 1000.
           #
-          # Measures V-Sekai-fire/datasource-store#20: one FDB read
-          # transaction shared across xRead calls, cached for 4 s per
-          # FdbFile. Before this fix, every xRead paid one GRV round-trip
-          # (~1-5 ms on CI); 100k reads gave 100-500 s of wall.
-          # The binary prints its whole report at the end, so nothing reaches
-          # the log until the run finishes; a timeout leaves it empty. The cap
-          # is therefore only a backstop against a hung workload eating the
-          # 30 min job budget, not a perf assertion. A healthy round is ~22 s,
-          # but it shares the runner with the FDB cluster, so 90 s was close
-          # enough to the noise floor to fail on load; 300 s is not.
-          # `set -o pipefail` makes the pipeline exit code the first non-zero
-          # one, so `timeout`'s 124 (or a real workload error) fails the step;
-          # without it, `tee`'s 0 would mask both.
+          # --sorted-load inserts the keys in the order the B-tree sorts
+          # them, so the load appends pages instead of rewriting them.
+          # --nomutex opens each worker's connection without SQLite's
+          # per-connection mutex, since no connection is shared, and drops
+          # the global memory statistics.
+          #
+          # [RUN] is the number to compare: the timed run alone, as YCSB's
+          # own `run` step reports it. [OVERALL] adds the load and the close,
+          # where the store folds its log into a shard.
           set -o pipefail
-          timeout 300 ./build/ycsb_direct 100000 100000 2 1000 2>&1 | tee /tmp/ycsb-direct.log
+          workers=$(nproc)
+          timeout 300 ./build/ycsb_direct $((100000 / workers)) $((100000 / workers)) \
+            "$workers" 1000 --sorted-load --nomutex 2>&1 | tee /tmp/ycsb-direct.log
 
       - name: Report FoundationDB status on failure
         if: failure()
@@ -120,7 +114,7 @@ jobs:
       - name: Report throughput
         if: always()
         run: |
-          echo '## sqlite-fdb-vfs-direct workload F (cache-size ladder)' >> $GITHUB_STEP_SUMMARY
+          echo '## sqlite-fdb-vfs-direct workload F' >> $GITHUB_STEP_SUMMARY
           echo '' >> $GITHUB_STEP_SUMMARY
           echo "datasource-store $STORE_VERSION ($(git -C datasource-store rev-parse --short HEAD 2>/dev/null || echo unknown))" >> $GITHUB_STEP_SUMMARY
           echo '' >> $GITHUB_STEP_SUMMARY

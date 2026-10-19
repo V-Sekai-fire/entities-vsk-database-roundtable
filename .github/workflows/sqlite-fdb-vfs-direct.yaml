@@ -48,7 +48,13 @@ jobs:
           done
           sudo sed -i '/^\[fdbserver\]/a storage_memory = 4GiB' "$conf"
           sudo systemctl restart foundationdb
-          fdbcli --exec "configure memory" --timeout 30
+          # The restarted processes join one by one, and configure refuses
+          # until enough have: retry until it is accepted.
+          for i in $(seq 1 30); do
+            fdbcli --exec "configure memory" --timeout 30 && break
+            [ "$i" = 30 ] && exit 1
+            sleep 2
+          done
           for i in $(seq 1 60); do
             if fdbcli --exec "status" --timeout 10 2>/dev/null | grep -q "Replication health  *- Healthy"; then
               break

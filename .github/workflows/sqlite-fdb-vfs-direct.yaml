@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     env:
-      STORE_VERSION: v0.1.0-dev.4
+      STORE_VERSION: 8045d4e2889a0e47a8fa5e6cca06c004a8ac36e7
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -102,10 +102,32 @@ jobs:
           # [RUN] is the number to compare: the timed run alone, as YCSB's
           # own `run` step reports it. [OVERALL] adds the load and the close,
           # where the store folds its log into a shard.
+          #
+          # A player process commits one row at a time beside each round, and
+          # reports its waits by the round's phase. Two settings alternate:
+          # folds at FoundationDB's batch priority (the store's default) and
+          # at default priority (WEFT_BULK_PRIORITY=default, the control).
           set -o pipefail
           workers=$(nproc)
-          timeout 300 ./build/ycsb_direct $((100000 / workers)) $((100000 / workers)) \
-            "$workers" 1000 --sorted-load --nomutex 2>&1 | tee /tmp/ycsb-direct.log
+          round() {
+            fdbcli --exec "writemode on; clearrange weft/db/ycsb weft/db/ycsc" --timeout 30 >/dev/null
+            rm -f /tmp/done /tmp/phases
+            ./build/ycsb_direct 0 0 1 1 --player /tmp/done --phases /tmp/phases --nomutex \
+              > /tmp/player.out 2>&1 &
+            player=$!
+            sleep 1
+            timeout 300 ./build/ycsb_direct $((100000 / workers)) $((100000 / workers)) \
+              "$workers" 1000 --sorted-load --nomutex --phases /tmp/phases
+            touch /tmp/done
+            wait $player
+            cat /tmp/player.out
+          }
+          for i in 1 2 3; do
+            echo "=== round $i: folds at batch priority"
+            round
+            echo "=== round $i: folds at default priority (control)"
+            WEFT_BULK_PRIORITY=default round
+          done 2>&1 | tee /tmp/ycsb-direct.log
 
       - name: Report FoundationDB status on failure
         if: failure()

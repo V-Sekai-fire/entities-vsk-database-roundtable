@@ -1,0 +1,168 @@
+name: sqlite-fdb-game-day
+# A player-day of game-shaped load on SQLite on FoundationDB, on a plain Linux runner.
+#
+# A player saving at 20 Hz commits 1 728 000 times a day, so the number that matters for a
+# day in VR is the far tail: the worst waits a day reaches, not the 99th percentile. This
+# runs FoundationDB alone under the player shape (`fdb_floor`), then the store under the
+# same players plus bulk work and folds (`game_load`) in six 15-minute blocks, sixteen
+# players at 20 Hz each, which is one player-day of ticks, and pools the blocks.
+#
+# The runner is a shared virtual machine, so its slowest cases include other tenants' work.
+# It is still real Linux on a cloud disk, which is what the desk's WSL numbers lacked.
+#
+# Two days run side by side: the store as it ships, and the store with one fold in flight
+# (`WEFT_FOLD_DEPTH=1`), the knob the desk could not judge through its stalls. The first
+# also runs a small frontier search (RFD 2323) from the seed levels alone, six short
+# generations, to see whether the loop finds its own neighbour levels on plain Linux.
+on:
+  push:
+    branches: ['dev/game-day**']
+  workflow_dispatch:
+concurrency:
+  group: sqlite-fdb-game-day-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  sqlite-fdb-game-day:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: shipped
+            fold_depth: ''
+          - name: fold-depth-1
+            fold_depth: '1'
+    timeout-minutes: 180
+    env:
+      STORE_VERSION: 85af4d1205ab6dd9dbaae241065f108253c0479f
+      WEFT_FDB_CLUSTER_FILE: /etc/foundationdb/fdb.cluster
+    steps:
+      - name: Install FoundationDB server and client
+        run: |
+          curl -LO https://github.com/apple/foundationdb/releases/download/7.3.63/foundationdb-server_7.3.63-1_amd64.deb
+          curl -LO https://github.com/apple/foundationdb/releases/download/7.3.63/foundationdb-clients_7.3.63-1_amd64.deb
+          sudo dpkg -i foundationdb-clients_7.3.63-1_amd64.deb
+          sudo dpkg -i foundationdb-server_7.3.63-1_amd64.deb
+
+      - name: One FoundationDB process per core, on the memory engine
+        run: |
+          # The same cluster the sqlite-fdb-vfs-direct round builds.
+          conf=/etc/foundationdb/foundationdb.conf
+          for port in $(seq 4501 $((4500 + $(nproc) - 1))); do
+            printf '\n[fdbserver.%s]\n' "$port" | sudo tee -a "$conf" >/dev/null
+          done
+          sudo sed -i '/^\[fdbserver\]/a storage_memory = 4GiB' "$conf"
+          sudo systemctl restart foundationdb
+          # The restarted processes join one by one, and configure refuses
+          # until enough have: retry until it is accepted.
+          for i in $(seq 1 30); do
+            fdbcli --exec "configure memory" --timeout 30 && break
+            [ "$i" = 30 ] && exit 1
+            sleep 2
+          done
+          for i in $(seq 1 60); do
+            if fdbcli --exec "status" --timeout 10 2>/dev/null | grep -q "Replication health  *- Healthy"; then
+              break
+            fi
+            sleep 2
+          done
+          fdbcli --exec "status" --timeout 10
+          nproc; free -g; df -h /var/lib/foundationdb
+
+      - name: Install build toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libsqlite3-dev
+
+      - name: Checkout V-Sekai-fire/datasource-store
+        uses: actions/checkout@v4
+        with:
+          repository: V-Sekai-fire/datasource-store
+          # A commit, never a branch tip, as in the other rounds.
+          ref: ${{ env.STORE_VERSION }}
+          path: datasource-store
+          submodules: recursive
+
+      - name: Build game_load and fdb_floor
+        working-directory: datasource-store
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target game_load fdb_floor -j
+
+      - name: Small frontier search from the seed levels, six generations
+        if: matrix.fold_depth == ''
+        working-directory: datasource-store
+        run: |
+          set -o pipefail
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            | sh -s -- -y --default-toolchain none
+          export PATH="$HOME/.elan/bin:$PATH"
+          cmake --build build -j
+          (cd witness && lake build frontier)
+          F=witness/.lake/build/bin/frontier
+          $F --self-test | tail -2
+          R=/tmp/frontier; mkdir -p $R; : > $R/runs.tsv
+          # The parents only: the loop has to propose its own mutations.
+          awk -F'\t' '$2=="-"' witness/records/2026-10-19-fedora-wsl-page-delta/levels.tsv \
+            > $R/levels.tsv
+          for g in 1 2 3 4 5 6; do
+            echo "=== generation $g"
+            $F run "$PWD/build" $R 20 60 | grep -vE '^[0-9]+\s'
+          done
+          $F plan $R | tee /tmp/frontier-plan.txt
+          fdbcli --exec "writemode on; clearrange frontier frontiet" --timeout 60 >/dev/null || true
+
+      - name: FoundationDB alone, the player shape, 10 minutes
+        working-directory: datasource-store
+        run: ./build/fdb_floor --players 16 --hz 20 --seconds 600 --warmup 5 | tee -a /tmp/day.log
+
+      - name: The store, players plus bulk work, one player-day in six blocks
+        working-directory: datasource-store
+        run: |
+          set -o pipefail
+          if [ -n "${{ matrix.fold_depth }}" ]; then export WEFT_FOLD_DEPTH=${{ matrix.fold_depth }}; fi
+          echo "WEFT_FOLD_DEPTH=${WEFT_FOLD_DEPTH:-shipped}" | tee -a /tmp/day.log
+          for i in 1 2 3 4 5 6; do
+            fdbcli --exec "writemode on; clearrange weft/db/game weft/db/gamf" --timeout 60 >/dev/null
+            echo "--- block $i"
+            ./build/game_load --players 16 --hz 20 --seconds 900 --warmup 5 \
+              --bulk-rows 100000 --bulk-rows-per-commit 10000 --bulk-commits-per-s 2 \
+              --dump /tmp/day.u32 | grep -E "TICK|HITCH|LATE|FOLD"
+          done 2>&1 | tee -a /tmp/day.log
+
+      - name: Pool the blocks into one day
+        if: always()
+        run: |
+          od -An -tu4 -v -w4 /tmp/day.u32 | sort -n > /tmp/day.sorted
+          awk '{ v[NR] = $1 } END {
+            n = NR; if (n == 0) exit 1
+            split("0.5 0.99 0.999 0.9999 0.99999 0.999999", q, " ")
+            printf "[DAY] ticks=%d player_days=%.3f", n, n / (20 * 86400)
+            for (i = 1; i <= 6; i++) printf " p%s=%d", q[i], v[int(q[i] * (n - 1)) + 1]
+            printf " max=%d\n", v[n]
+            split("20000 50000 100000 250000 500000 1000000", l, " ")
+            printf "[DAY-HITCH]"
+            for (j = 1; j <= 6; j++) { c = 0; for (i = n; i >= 1 && v[i] > l[j]; i--) c++
+              printf " over_%dms=%d", l[j] / 1000, c }
+            printf "\n"
+          }' /tmp/day.sorted | tee -a /tmp/day.log
+          echo '## sqlite-fdb game day, ${{ matrix.name }}' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat /tmp/day.log >> $GITHUB_STEP_SUMMARY
+          [ -f /tmp/frontier-plan.txt ] && cat /tmp/frontier-plan.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Report FoundationDB status on failure
+        if: failure()
+        run: fdbcli --exec "status details" --timeout 10 || true
+
+      - name: Upload the day
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: game-day-${{ matrix.name }}
+          path: |
+            /tmp/day.log
+            /tmp/day.u32
+            /tmp/frontier-plan.txt
+            /tmp/frontier/*.tsv

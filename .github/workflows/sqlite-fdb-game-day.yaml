@@ -12,7 +12,7 @@ name: sqlite-fdb-game-day
 #
 # Two days run side by side: the store as it ships, and the store with one fold in flight
 # (`WEFT_FOLD_DEPTH=1`), the knob the desk could not judge through its stalls. The first
-# also runs a small frontier search (RFD 2323) from the seed levels alone, six short
+# also runs a small frontier search (RFD66606-2323) from the seed levels alone, six short
 # generations, to see whether the loop finds its own neighbour levels on plain Linux.
 on:
   push:
